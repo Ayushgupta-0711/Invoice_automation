@@ -1,0 +1,1 @@
+"""Invoice Automation application package."""

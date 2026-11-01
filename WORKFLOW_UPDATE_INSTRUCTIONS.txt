@@ -1,0 +1,18 @@
+INVOICE AUTOMATION - WORKFLOW UPDATE
+
+1. Stop Streamlit (Ctrl+C) and stop Uvicorn if it is running.
+2. Extract this ZIP into the existing project root:
+   E:\python_6\Projects\Invoice_automation
+3. Choose Replace files for the included files.
+4. Do NOT replace/delete .env, venv, data/raw, or your MySQL database.
+5. In an activated project CMD, run:
+   python -m pytest -q
+6. Start Streamlit:
+   streamlit run dashboard\app.py
+7. Optional API in a second CMD:
+   python -m uvicorn src.api.main:app --reload
+   Open http://127.0.0.1:8000/docs
+
+The new Streamlit pages are Exceptions, Approvals, and Payments.
+Payment recording is a demo bookkeeping action only. It does not transfer funds.
+The local demo does not implement authenticated login; do not expose it publicly.

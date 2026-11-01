@@ -1,0 +1,25 @@
+SYNTHETIC DATA GENERATOR UPDATE
+
+1. Extract this ZIP into:
+   E:\python_6\Projects\Invoice_automation
+
+2. Choose Replace only if Windows asks about the included generator/test files.
+   Do not replace .env, venv, your database, uploaded documents, or existing application modules.
+
+3. Open CMD in the project root and activate the existing virtual environment:
+   cd /d E:\python_6\Projects\Invoice_automation
+   venv\Scripts\activate
+
+4. Run the automated tests:
+   python -m pytest -q
+
+5. Generate the dataset (CSV only; no MySQL data is changed):
+   python data\generator\generate_dataset.py --seed 20261022
+
+6. Review:
+   data\generated\seed_20261022\validation_report.json
+   data\generated\seed_20261022\manifest.json
+
+The loader is optional and must be explicitly requested with --load-mysql. Do not run that option until
+we have reviewed the generated CSVs and confirmed the target MySQL database. It appends SYN-prefixed
+records and does not overwrite or delete your existing demo records.

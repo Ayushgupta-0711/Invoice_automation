@@ -1,0 +1,415 @@
+"""Transactional exception, approval and payment workflows.
+
+The service intentionally separates data capture from authorization. An invoice
+can be approved only after its blocking exceptions are cleared and its PO match
+(or non-PO account coding) is complete. Payments are recorded only against an
+approved invoice and cannot exceed the remaining balance.
+"""
+from __future__ import annotations
+
+import uuid
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any
+
+from sqlalchemy import text
+
+from database.connection import get_engine
+
+MONEY_TOLERANCE = Decimal("0.01")
+
+
+def _id(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:20].upper()}"
+
+
+def _money(value: Any) -> Decimal:
+    return Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _check_invoice_gate(conn, invoice_id: str) -> dict[str, Any]:
+    """Validate common prerequisites for approval/payment inside a transaction."""
+    invoice = conn.execute(text("""SELECT i.invoice_id, i.vendor_id, i.po_id,
+            i.calculated_total, i.currency_code, i.invoice_status, i.match_status,
+            i.submitted_by, v.vendor_status
+        FROM invoices i JOIN vendors v ON v.vendor_id = i.vendor_id
+        WHERE i.invoice_id = :invoice_id FOR UPDATE"""),
+        {"invoice_id": invoice_id}).mappings().first()
+    if not invoice:
+        raise ValueError(f"Invoice not found: {invoice_id}")
+    if invoice["vendor_status"] != "ACTIVE":
+        raise ValueError(f"Vendor is {invoice['vendor_status']}; processing is blocked.")
+
+    blockers = int(conn.execute(text("""SELECT COUNT(*) FROM invoice_exceptions
+        WHERE invoice_id = :invoice_id AND is_blocking = 1
+          AND exception_status IN ('OPEN','IN_REVIEW')"""),
+        {"invoice_id": invoice_id}).scalar_one())
+    if blockers:
+        raise ValueError(f"Invoice has {blockers} unresolved blocking exception(s). Resolve them first.")
+
+    if invoice["po_id"] is not None:
+        if invoice["match_status"] != "MATCHED":
+            raise ValueError(f"PO-backed invoice matching is {invoice['match_status']}; matching must be MATCHED before approval.")
+        incomplete = conn.execute(text("""SELECT COUNT(*) FROM invoice_lines il
+            LEFT JOIN (
+                SELECT invoice_line_id, SUM(matched_quantity) AS matched_qty
+                FROM invoice_po_line_matches
+                WHERE invoice_id = :invoice_id
+                GROUP BY invoice_line_id
+            ) m ON m.invoice_line_id = il.invoice_line_id
+            WHERE il.invoice_id = :invoice_id
+              AND COALESCE(m.matched_qty, 0) + 0.0001 < il.quantity"""),
+            {"invoice_id": invoice_id}).scalar_one()
+        if int(incomplete):
+            raise ValueError("One or more invoice lines do not have complete PO/receipt allocations.")
+    else:
+        coding = conn.execute(text("""SELECT
+                COALESCE(SUM(coding_amount), 0) AS coded_total,
+                COUNT(*) AS coding_count,
+                SUM(CASE WHEN coding_status NOT IN ('SUBMITTED','APPROVED') THEN 1 ELSE 0 END) AS invalid_count
+            FROM invoice_account_codings WHERE invoice_id = :invoice_id"""),
+            {"invoice_id": invoice_id}).mappings().one()
+        total = _money(invoice["calculated_total"])
+        coded = _money(coding["coded_total"])
+        if not coding["coding_count"] or int(coding["invalid_count"] or 0) > 0:
+            raise ValueError("Non-PO invoice needs submitted account coding before approval.")
+        if abs(coded - total) > MONEY_TOLERANCE:
+            raise ValueError(f"Non-PO account coding ({coded}) does not reconcile to invoice total ({total}).")
+
+    return dict(invoice)
+
+
+def assign_exception(exception_id: str, assigned_to: str) -> dict[str, Any]:
+    with get_engine().begin() as conn:
+        row = conn.execute(text("""SELECT exception_id, invoice_id, exception_status
+            FROM invoice_exceptions WHERE exception_id = :exception_id FOR UPDATE"""),
+            {"exception_id": exception_id}).mappings().first()
+        if not row:
+            raise ValueError(f"Exception not found: {exception_id}")
+        user_exists = conn.execute(text("SELECT 1 FROM users WHERE user_id = :user_id AND is_active = 1"),
+                                   {"user_id": assigned_to}).first()
+        if not user_exists:
+            raise ValueError("Select an active user for exception assignment.")
+        conn.execute(text("""UPDATE invoice_exceptions
+            SET assigned_to = :assigned_to,
+                exception_status = CASE WHEN exception_status = 'OPEN' THEN 'IN_REVIEW' ELSE exception_status END
+            WHERE exception_id = :exception_id"""),
+            {"assigned_to": assigned_to, "exception_id": exception_id})
+        conn.execute(text("""UPDATE invoices SET payment_ready = 0
+            WHERE invoice_id = :invoice_id"""), {"invoice_id": row["invoice_id"]})
+        return {"exception_id": exception_id, "invoice_id": row["invoice_id"],
+                "assigned_to": assigned_to, "status": "IN_REVIEW" if row["exception_status"] == "OPEN" else row["exception_status"]}
+
+
+def resolve_exception(exception_id: str, resolved_by: str, resolution_notes: str,
+                      *, waive: bool = False) -> dict[str, Any]:
+    notes = (resolution_notes or "").strip()
+    if len(notes) < 8:
+        raise ValueError("Please enter resolution notes (at least 8 characters).")
+    new_status = "WAIVED" if waive else "RESOLVED"
+    with get_engine().begin() as conn:
+        row = conn.execute(text("""SELECT exception_id, invoice_id, exception_status
+            FROM invoice_exceptions WHERE exception_id = :exception_id FOR UPDATE"""),
+            {"exception_id": exception_id}).mappings().first()
+        if not row:
+            raise ValueError(f"Exception not found: {exception_id}")
+        if row["exception_status"] in ("RESOLVED", "WAIVED"):
+            raise ValueError("This exception has already been closed.")
+        user_exists = conn.execute(text("SELECT 1 FROM users WHERE user_id = :user_id AND is_active = 1"),
+                                   {"user_id": resolved_by}).first()
+        if not user_exists:
+            raise ValueError("Select an active user to resolve this exception.")
+        conn.execute(text("""UPDATE invoice_exceptions
+            SET exception_status = :status, resolved_by = :resolved_by,
+                resolved_at = CURRENT_TIMESTAMP, resolution_notes = :notes
+            WHERE exception_id = :exception_id"""),
+            {"status": new_status, "resolved_by": resolved_by,
+             "notes": notes, "exception_id": exception_id})
+        remaining = int(conn.execute(text("""SELECT COUNT(*) FROM invoice_exceptions
+            WHERE invoice_id = :invoice_id AND is_blocking = 1
+              AND exception_status IN ('OPEN','IN_REVIEW')"""),
+            {"invoice_id": row["invoice_id"]}).scalar_one())
+        previous_status = conn.execute(text("SELECT invoice_status FROM invoices WHERE invoice_id = :invoice_id FOR UPDATE"),
+                                       {"invoice_id": row["invoice_id"]}).scalar_one()
+        # Clearing an exception does not itself make a PO-backed invoice match.
+        # Keep it blocked until matching is rerun and produces MATCHED.
+        po_id, match_status = conn.execute(text(
+            "SELECT po_id, match_status FROM invoices WHERE invoice_id = :invoice_id"
+        ), {"invoice_id": row["invoice_id"]}).one()
+        if remaining:
+            next_status = "PENDING_EXCEPTION"
+        elif po_id is not None and match_status != "MATCHED":
+            next_status = "PENDING_EXCEPTION"
+        else:
+            next_status = "PENDING_APPROVAL"
+        conn.execute(text("""UPDATE invoices SET invoice_status = :status, payment_ready = 0
+            WHERE invoice_id = :invoice_id"""),
+            {"status": next_status, "invoice_id": row["invoice_id"]})
+        conn.execute(text("""INSERT INTO invoice_events
+            (event_id, invoice_id, event_type, previous_status, new_status,
+             actor_id, event_reason, occurred_at)
+            VALUES (:event_id, :invoice_id, 'EXCEPTION_CLOSED', :previous_status,
+                    :new_status, :actor_id, :reason, CURRENT_TIMESTAMP)"""),
+            {"event_id": _id("IEVT"), "invoice_id": row["invoice_id"],
+             "previous_status": previous_status, "new_status": next_status,
+             "actor_id": resolved_by,
+             "reason": f"Exception {exception_id} {new_status.lower()}: {notes}"})
+        return {"exception_id": exception_id, "exception_status": new_status,
+                "invoice_id": row["invoice_id"], "remaining_blocking_exceptions": remaining,
+                "invoice_status": next_status, "payment_ready": False}
+
+
+
+def request_approval(invoice_id: str, approver_id: str, comments: str | None = None) -> dict[str, Any]:
+    with get_engine().begin() as conn:
+        invoice = _check_invoice_gate(conn, invoice_id)
+
+        if invoice["invoice_status"] != "PENDING_APPROVAL":
+            raise ValueError(
+                f"Invoice status {invoice['invoice_status']} is not eligible for approval submission."
+            )
+
+        approver = conn.execute(
+            text("""
+                SELECT 1 FROM users
+                WHERE user_id = :user_id
+                  AND is_active = 1
+                  AND role IN ('APPROVER', 'ADMIN')
+            """),
+            {"user_id": approver_id}
+        ).first()
+
+        if not approver:
+            raise ValueError(
+                "Approver must be an active user with APPROVER or ADMIN role."
+            )
+
+        existing = conn.execute(
+            text("""
+                SELECT approval_id, approval_status
+                FROM approvals
+                WHERE invoice_id = :invoice_id
+                  AND approval_status IN ('PENDING', 'APPROVED')
+                LIMIT 1
+                FOR UPDATE
+            """),
+            {"invoice_id": invoice_id}
+        ).mappings().first()
+
+        if existing:
+            raise ValueError(
+                f"An approval record already exists with status "
+                f"{existing['approval_status']}. Duplicate submission is not allowed."
+            )
+
+        level = int(conn.execute(
+            text("""
+                SELECT COALESCE(MAX(approval_level), 0) + 1
+                FROM approvals
+                WHERE invoice_id = :invoice_id
+            """),
+            {"invoice_id": invoice_id}
+        ).scalar_one())
+
+        approval_id = _id("APR")
+
+        conn.execute(
+            text("""
+                INSERT INTO approvals
+                (approval_id, invoice_id, approval_level, approver_id,
+                 approval_status, assigned_at, comments)
+                VALUES
+                (:approval_id, :invoice_id, :level, :approver_id,
+                 'PENDING', CURRENT_TIMESTAMP, :comments)
+            """),
+            {
+                "approval_id": approval_id,
+                "invoice_id": invoice_id,
+                "level": level,
+                "approver_id": approver_id,
+                "comments": comments
+            }
+        )
+
+        conn.execute(
+            text("""
+                INSERT INTO approval_events
+                (event_id, approval_id, previous_status, new_status,
+                 actor_id, comments, occurred_at)
+                VALUES
+                (:event_id, :approval_id, NULL, 'PENDING',
+                 :actor_id, :comments, CURRENT_TIMESTAMP)
+            """),
+            {
+                "event_id": _id("APEVT"),
+                "approval_id": approval_id,
+                "actor_id": invoice.get("submitted_by"),
+                "comments": comments or "Approval requested."
+            }
+        )
+
+        conn.execute(
+            text("""
+                UPDATE invoices
+                SET invoice_status = 'PENDING_APPROVAL',
+                    payment_ready = 0
+                WHERE invoice_id = :invoice_id
+            """),
+            {"invoice_id": invoice_id}
+        )
+
+        return {
+            "approval_id": approval_id,
+            "invoice_id": invoice_id,
+            "approval_level": level,
+            "approval_status": "PENDING",
+            "already_exists": False
+        }
+
+
+
+def decide_approval(approval_id: str, actor_id: str, decision: str, comments: str = "") -> dict[str, Any]:
+    decision = decision.strip().upper()
+    if decision not in ("APPROVED", "REJECTED"):
+        raise ValueError("Decision must be APPROVED or REJECTED.")
+    with get_engine().begin() as conn:
+        approval = conn.execute(text("""SELECT approval_id, invoice_id, approver_id, approval_status
+            FROM approvals WHERE approval_id = :approval_id FOR UPDATE"""),
+            {"approval_id": approval_id}).mappings().first()
+        if not approval:
+            raise ValueError(f"Approval not found: {approval_id}")
+        if approval["approval_status"] != "PENDING":
+            raise ValueError(f"Approval is already {approval['approval_status']}.")
+        if approval["approver_id"] != actor_id:
+            raise ValueError("Only the assigned approver can make this decision.")
+        if decision == "APPROVED":
+            _check_invoice_gate(conn, str(approval["invoice_id"]))
+        conn.execute(text("""UPDATE approvals SET approval_status = :decision,
+            decision_at = CURRENT_TIMESTAMP, comments = :comments
+            WHERE approval_id = :approval_id"""),
+            {"decision": decision, "comments": comments or None, "approval_id": approval_id})
+        conn.execute(text("""INSERT INTO approval_events
+            (event_id, approval_id, previous_status, new_status, actor_id, comments, occurred_at)
+            VALUES (:event_id, :approval_id, 'PENDING', :decision, :actor_id, :comments, CURRENT_TIMESTAMP)"""),
+            {"event_id": _id("APEVT"), "approval_id": approval_id,
+             "decision": decision, "actor_id": actor_id, "comments": comments or None})
+
+        invoice_id = str(approval["invoice_id"])
+        previous = conn.execute(text("SELECT invoice_status FROM invoices WHERE invoice_id = :invoice_id FOR UPDATE"),
+                                {"invoice_id": invoice_id}).scalar_one()
+        if decision == "REJECTED":
+            next_status = "REJECTED"
+            payment_ready = 0
+        else:
+            pending = int(conn.execute(text("SELECT COUNT(*) FROM approvals WHERE invoice_id = :invoice_id AND approval_status = 'PENDING'"),
+                                       {"invoice_id": invoice_id}).scalar_one())
+            rejected = int(conn.execute(text("SELECT COUNT(*) FROM approvals WHERE invoice_id = :invoice_id AND approval_status = 'REJECTED'"),
+                                        {"invoice_id": invoice_id}).scalar_one())
+            if rejected:
+                next_status, payment_ready = "REJECTED", 0
+            elif pending:
+                next_status, payment_ready = "PENDING_APPROVAL", 0
+            else:
+                # Recheck preconditions after decision, including blocking exceptions and matching/coding.
+                invoice = _check_invoice_gate(conn, invoice_id)
+                paid = _money(conn.execute(text("SELECT COALESCE(SUM(payment_amount),0) FROM payments WHERE invoice_id = :invoice_id AND payment_status = 'PAID'"),
+                                           {"invoice_id": invoice_id}).scalar_one())
+                total = _money(invoice["calculated_total"])
+                next_status = "PARTIALLY_PAID" if paid > 0 else "APPROVED"
+                payment_ready = int(paid < total)
+        conn.execute(text("UPDATE invoices SET invoice_status = :status, payment_ready = :ready WHERE invoice_id = :invoice_id"),
+                     {"status": next_status, "ready": payment_ready, "invoice_id": invoice_id})
+        conn.execute(text("""INSERT INTO invoice_events
+            (event_id, invoice_id, event_type, previous_status, new_status, actor_id, event_reason, occurred_at)
+            VALUES (:event_id, :invoice_id, 'APPROVAL_DECISION', :previous, :new, :actor, :reason, CURRENT_TIMESTAMP)"""),
+            {"event_id": _id("IEVT"), "invoice_id": invoice_id, "previous": previous,
+             "new": next_status, "actor": actor_id, "reason": comments or decision})
+        return {"approval_id": approval_id, "invoice_id": invoice_id,
+                "approval_status": decision, "invoice_status": next_status,
+                "payment_ready": bool(payment_ready)}
+
+
+def record_payment(invoice_id: str, approval_id: str, processed_by: str,
+                   payment_amount: Decimal | str | float, payment_method: str,
+                   bank_reference: str | None = None) -> dict[str, Any]:
+    amount = _money(payment_amount)
+    if amount <= 0:
+        raise ValueError("Payment amount must be greater than zero.")
+    if payment_method not in ("NEFT", "RTGS", "IMPS", "UPI", "BANK_TRANSFER", "CHEQUE", "OTHER"):
+        raise ValueError("Choose a supported payment method.")
+    with get_engine().begin() as conn:
+        invoice = _check_invoice_gate(conn, invoice_id)
+        
+        if invoice["invoice_status"] not in ("APPROVED", "PARTIALLY_PAID"):
+            raise ValueError(
+                f"Invoice status {invoice['invoice_status']} is not eligible for payment."
+            )
+        approval = conn.execute(text("""SELECT approval_id, approval_status
+            FROM approvals WHERE approval_id = :approval_id AND invoice_id = :invoice_id FOR UPDATE"""),
+            {"approval_id": approval_id, "invoice_id": invoice_id}).mappings().first()
+        if not approval or approval["approval_status"] != "APPROVED":
+            raise ValueError("A matching approved approval record is required before recording payment.")
+        pending = int(conn.execute(text("SELECT COUNT(*) FROM approvals WHERE invoice_id = :invoice_id AND approval_status <> 'APPROVED'"),
+                                   {"invoice_id": invoice_id}).scalar_one())
+        if pending:
+            raise ValueError("All approval levels must be approved before payment.")
+        user = conn.execute(text("SELECT 1 FROM users WHERE user_id = :user_id AND is_active = 1"),
+                            {"user_id": processed_by}).first()
+        if not user:
+            raise ValueError("Select an active user to record the payment.")
+        total = _money(invoice["calculated_total"])
+        paid = _money(conn.execute(text("SELECT COALESCE(SUM(payment_amount),0) FROM payments WHERE invoice_id = :invoice_id AND payment_status = 'PAID'"),
+                                   {"invoice_id": invoice_id}).scalar_one())
+        outstanding = total - paid
+        if amount > outstanding:
+            raise ValueError(f"Payment exceeds outstanding balance of {outstanding:.2f}.")
+        payment_id = _id("PAY")
+        payment_reference = f"PAYREF-{uuid.uuid4().hex[:16].upper()}"
+        conn.execute(text("""INSERT INTO payments
+            (payment_id, invoice_id, approval_id, payment_reference, payment_amount,
+             currency_code, payment_date, payment_method, bank_reference,
+             payment_status, processed_by)
+            VALUES (:payment_id, :invoice_id, :approval_id, :payment_reference, :amount,
+                    :currency, CURRENT_DATE, :method, :bank_reference, 'PAID', :processed_by)"""),
+            {"payment_id": payment_id, "invoice_id": invoice_id, "approval_id": approval_id,
+             "payment_reference": payment_reference, "amount": amount,
+             "currency": invoice.get("currency_code") or "INR", "method": payment_method,
+             "bank_reference": bank_reference or None, "processed_by": processed_by})
+        for previous, new_status in ((None, "PENDING"), ("PENDING", "PROCESSING"), ("PROCESSING", "PAID")):
+            conn.execute(text("""INSERT INTO payment_events
+                (event_id, payment_id, previous_status, new_status, actor_id, comments, occurred_at)
+                VALUES (:event_id, :payment_id, :previous, :new, :actor, :comments, CURRENT_TIMESTAMP)"""),
+                {"event_id": _id("PEVT"), "payment_id": payment_id, "previous": previous,
+                 "new": new_status, "actor": processed_by,
+                 "comments": "Payment recorded as completed in the demo system."})
+        new_paid = paid + amount
+        new_outstanding = total - new_paid
+        next_status = "PAID" if new_outstanding <= MONEY_TOLERANCE else "PARTIALLY_PAID"
+        payment_ready = int(new_outstanding > MONEY_TOLERANCE)
+        previous_status = str(invoice["invoice_status"])
+        conn.execute(text("UPDATE invoices SET invoice_status = :status, payment_ready = :ready WHERE invoice_id = :invoice_id"),
+                     {"status": next_status, "ready": payment_ready, "invoice_id": invoice_id})
+        conn.execute(text("""INSERT INTO invoice_events
+            (event_id, invoice_id, event_type, previous_status, new_status, actor_id, event_reason, occurred_at)
+            VALUES (:event_id, :invoice_id, 'PAYMENT_RECORDED', :previous, :new, :actor, :reason, CURRENT_TIMESTAMP)"""),
+            {"event_id": _id("IEVT"), "invoice_id": invoice_id, "previous": previous_status,
+             "new": next_status, "actor": processed_by,
+             "reason": f"Payment {payment_reference} recorded for {amount:.2f} {invoice.get('currency_code') or 'INR'}."})
+        return {"payment_id": payment_id, "payment_reference": payment_reference,
+                "invoice_id": invoice_id, "payment_amount": str(amount),
+                "total_paid": str(new_paid), "outstanding_balance": str(new_outstanding),
+                "invoice_status": next_status, "payment_ready": bool(payment_ready)}
+
+
+def get_payment_summary(limit: int = 500):
+    import pandas as pd
+    sql = text("""SELECT i.invoice_id, v.vendor_name, i.currency_code,
+            i.calculated_total,
+            COALESCE(SUM(CASE WHEN p.payment_status = 'PAID' THEN p.payment_amount ELSE 0 END),0) AS total_paid,
+            i.calculated_total - COALESCE(SUM(CASE WHEN p.payment_status = 'PAID' THEN p.payment_amount ELSE 0 END),0) AS outstanding_balance,
+            i.invoice_status, i.payment_ready
+        FROM invoices i JOIN vendors v ON v.vendor_id = i.vendor_id
+        LEFT JOIN payments p ON p.invoice_id = i.invoice_id
+        GROUP BY i.invoice_id, v.vendor_name, i.currency_code, i.calculated_total, i.invoice_status, i.payment_ready
+        ORDER BY i.received_at DESC LIMIT :limit""")
+    with get_engine().connect() as conn:
+        return pd.read_sql(sql, conn, params={"limit": int(limit)})

@@ -1,0 +1,278 @@
+"""Streamlit dashboard for the Invoice Automation System."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+import pandas as pd
+import streamlit as st
+from sqlalchemy import bindparam, text
+
+from database.connection import get_engine, test_connection
+from src.services.dashboard_service import (
+    get_dashboard_metrics,
+    get_invoice_register,
+    get_open_exceptions,
+)
+from src.services.invoice_service import validate_invoice
+from src.matching.matching_service import inspect_invoice_matches, run_three_way_match
+from src.services.workflow_service import (
+    assign_exception,
+    resolve_exception,
+    request_approval,
+    decide_approval,
+    record_payment,
+    get_payment_summary,
+)
+from dashboard.invoice_intake import render_invoice_intake
+
+st.set_page_config(page_title="Invoice Automation", page_icon="🧾", layout="wide")
+st.title("🧾 Invoice Automation System")
+st.caption("Invoice intake · OCR support · Three-way matching · Exceptions · Approvals · Payments")
+
+
+def _active_users(roles: tuple[str, ...] | None = None) -> list[dict]:
+    sql = "SELECT user_id, full_name, role FROM users WHERE is_active = 1"
+    params = {}
+    if roles:
+        sql += " AND role IN :roles"
+        sql = text(sql).bindparams(bindparam("roles", expanding=True))
+        params["roles"] = list(roles)
+    else:
+        sql = text(sql)
+    with get_engine().connect() as conn:
+        return [dict(row) for row in conn.execute(sql, params).mappings().all()]
+
+
+def _invoice_ids() -> list[str]:
+    with get_engine().connect() as conn:
+        return list(conn.execute(text("SELECT invoice_id FROM invoices ORDER BY received_at DESC")).scalars().all())
+
+
+with st.sidebar:
+    st.header("Navigation")
+    page = st.radio(
+        "Choose a page",
+        ["Overview", "Invoice Intake", "Invoice Register", "Exceptions", "Approvals", "Payments", "Invoice Validation", "Matching Check"],
+    )
+    st.divider()
+    if st.button("Test database connection", use_container_width=True):
+        try:
+            info = test_connection()
+            st.success(f"Connected to {info['database']} (MySQL {info['mysql_version']})")
+        except Exception as exc:
+            st.error(str(exc))
+
+try:
+    if page == "Invoice Intake":
+        render_invoice_intake()
+
+    elif page == "Overview":
+        metrics = get_dashboard_metrics()
+        cols = st.columns(5)
+        cols[0].metric("Invoices", int(metrics["total_invoices"]))
+        cols[1].metric("Pending approvals", int(metrics["pending_approvals"]))
+        cols[2].metric("Blocking exceptions", int(metrics["open_blocking_exceptions"]))
+        cols[3].metric("Payment-ready", int(metrics["payment_ready"]))
+        cols[4].metric("Paid amount", f"₹{float(metrics['total_paid']):,.2f}")
+        st.subheader("Recent invoices")
+        st.dataframe(get_invoice_register(100), use_container_width=True, hide_index=True)
+        st.subheader("Open exceptions")
+        st.dataframe(get_open_exceptions(100), use_container_width=True, hide_index=True)
+
+    elif page == "Invoice Register":
+        st.subheader("Invoice Register")
+        st.dataframe(get_invoice_register(500), use_container_width=True, hide_index=True)
+
+    elif page == "Exceptions":
+        st.subheader("Exception Management")
+        st.caption("Assign an exception, move it into review, then record a documented resolution or waiver.")
+        exceptions = get_open_exceptions(500)
+        if exceptions.empty:
+            st.success("No open exceptions found.")
+        else:
+            st.dataframe(exceptions, use_container_width=True, hide_index=True)
+            exception_ids = exceptions["exception_id"].astype(str).tolist()
+            selected_exception = st.selectbox("Select an exception", exception_ids)
+            selected_row = exceptions.loc[exceptions["exception_id"] == selected_exception].iloc[0]
+            st.info(f"Invoice: {selected_row['invoice_id']} · Issue: {selected_row['issue_type']} · Severity: {selected_row['severity']}")
+            users = _active_users()
+            if users:
+                user_labels = {f"{u['full_name']} ({u['role']}) — {u['user_id']}": u["user_id"] for u in users}
+                selected_user_label = st.selectbox("Assign / handled by", list(user_labels))
+                selected_user = user_labels[selected_user_label]
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Assign and mark In Review", use_container_width=True):
+                        try:
+                            result = assign_exception(selected_exception, selected_user)
+                            st.success(f"Exception assigned to {result['assigned_to']} and marked {result['status']}.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+                with c2:
+                    st.caption("Resolution requires notes and an active user.")
+                resolution_notes = st.text_area("Resolution notes", placeholder="Describe evidence checked and the corrective action taken.")
+                r1, r2 = st.columns(2)
+                with r1:
+                    if st.button("Resolve exception", type="primary", use_container_width=True):
+                        try:
+                            result = resolve_exception(selected_exception, selected_user, resolution_notes)
+                            st.success(f"Resolved. Invoice status: {result['invoice_status']}. Remaining blockers: {result['remaining_blocking_exceptions']}.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+                with r2:
+                    if st.button("Waive exception", use_container_width=True):
+                        try:
+                            result = resolve_exception(selected_exception, selected_user, resolution_notes, waive=True)
+                            st.warning(f"Exception waived. Invoice status: {result['invoice_status']}.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+            else:
+                st.warning("Create an active user before assigning or resolving exceptions.")
+
+    elif page == "Approvals":
+        st.subheader("Approval Workflow")
+        st.caption("Only invoices that pass the matching / account-coding and blocking-exception checks can be approved.")
+        with get_engine().connect() as conn:
+            approval_df = pd.read_sql(text("""SELECT a.approval_id, a.invoice_id, v.vendor_name,
+                    a.approval_level, u.full_name AS approver, a.approval_status, a.assigned_at, a.decision_at, a.comments
+                FROM approvals a JOIN invoices i ON i.invoice_id = a.invoice_id
+                JOIN vendors v ON v.vendor_id = i.vendor_id
+                JOIN users u ON u.user_id = a.approver_id
+                ORDER BY CASE a.approval_status WHEN 'PENDING' THEN 0 ELSE 1 END, a.assigned_at DESC"""), conn)
+        if approval_df.empty:
+            st.info("No approval records yet.")
+        else:
+            st.dataframe(approval_df, use_container_width=True, hide_index=True)
+        st.markdown("#### Request approval")
+        invoices = _invoice_ids()
+        approvers = _active_users(("APPROVER", "ADMIN"))
+        if invoices and approvers:
+            with st.form("request_approval_form"):
+                req_invoice = st.selectbox("Invoice to submit", invoices)
+                approver_labels = {f"{u['full_name']} — {u['user_id']}": u["user_id"] for u in approvers}
+                req_approver_label = st.selectbox("Approver", list(approver_labels))
+                req_comments = st.text_input("Request note", value="Please review this invoice.")
+                submitted = st.form_submit_button("Submit for approval", type="primary")
+            if submitted:
+                try:
+                    result = request_approval(req_invoice, approver_labels[req_approver_label], req_comments)
+                    st.success(f"Approval request: {result['approval_id']} ({result['approval_status']}).")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        else:
+            st.info("An invoice and active APPROVER/ADMIN user are required.")
+
+        st.markdown("#### Decide a pending approval")
+        pending_rows = approval_df[approval_df["approval_status"] == "PENDING"] if not approval_df.empty else approval_df
+        if not pending_rows.empty:
+            pending_ids = pending_rows["approval_id"].astype(str).tolist()
+            approver_users = _active_users(("APPROVER", "ADMIN"))
+            actor_options = {f"{u['full_name']} — {u['user_id']}": u["user_id"] for u in approver_users}
+            with st.form("approval_decision_form"):
+                pending_id = st.selectbox("Pending approval", pending_ids)
+                acting_user_label = st.selectbox("Acting approver", list(actor_options))
+                decision_note = st.text_area("Decision comments")
+                decision_col1, decision_col2 = st.columns(2)
+                approve_submit = decision_col1.form_submit_button("Approve", type="primary", use_container_width=True)
+                reject_submit = decision_col2.form_submit_button("Reject", use_container_width=True)
+            if approve_submit or reject_submit:
+                try:
+                    actor_id = actor_options[acting_user_label]
+                    decision = "APPROVED" if approve_submit else "REJECTED"
+                    result = decide_approval(pending_id, actor_id, decision, decision_note)
+                    st.success(f"Approval {decision.lower()}. Invoice status: {result['invoice_status']}.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        else:
+            st.info("No pending approvals to decide.")
+
+    elif page == "Payments":
+        st.subheader("Payment Management")
+        st.caption("This demo records a payment reported as completed externally; it does not connect to a bank or initiate a transfer.")
+        st.dataframe(get_payment_summary(500), use_container_width=True, hide_index=True)
+        with get_engine().connect() as conn:
+            approved_rows = conn.execute(text("""SELECT a.approval_id, a.invoice_id, i.calculated_total,
+                    i.currency_code, i.invoice_status
+                FROM approvals a JOIN invoices i ON i.invoice_id = a.invoice_id
+                WHERE a.approval_status = 'APPROVED' AND i.payment_ready = 1
+                ORDER BY a.decision_at DESC""")).mappings().all()
+        if approved_rows:
+            approved_options = {f"{row['invoice_id']} · {row['approval_id']} · {row['invoice_status']}": dict(row) for row in approved_rows}
+            with st.form("record_payment_form"):
+                chosen_label = st.selectbox("Approved invoice / approval", list(approved_options))
+                chosen = approved_options[chosen_label]
+                amount = st.number_input("Payment amount", min_value=0.01, value=1000.00, step=100.00, format="%.2f")
+                method = st.selectbox("Payment method", ["NEFT", "RTGS", "IMPS", "UPI", "BANK_TRANSFER", "CHEQUE", "OTHER"])
+                bank_ref = st.text_input("External bank / transaction reference (optional)")
+                operators = _active_users()
+                operator_map = {f"{u['full_name']} — {u['user_id']}": u["user_id"] for u in operators}
+                operator_label = st.selectbox("Recorded by", list(operator_map))
+                payment_submit = st.form_submit_button("Record completed payment", type="primary")
+            if payment_submit:
+                try:
+                    result = record_payment(chosen["invoice_id"], chosen["approval_id"], operator_map[operator_label], amount, method, bank_ref)
+                    st.success(f"Payment recorded: {result['payment_reference']} · Outstanding: {result['outstanding_balance']} · Status: {result['invoice_status']}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        else:
+            st.info("No approved invoices are available for payment recording.")
+
+    elif page == "Invoice Validation":
+        st.subheader("Recalculate and validate an invoice")
+        with get_engine().connect() as conn:
+            invoice_ids = conn.execute(text("SELECT invoice_id FROM invoices ORDER BY received_at DESC")).scalars().all()
+        if not invoice_ids:
+            st.info("No invoices are available yet.")
+        else:
+            selected = st.selectbox("Invoice", invoice_ids)
+            st.warning("Validation recalculates totals and records detected duplicate/total-mismatch exceptions. It does not approve or enable payment.")
+            if st.button("Run invoice validation", type="primary"):
+                result = validate_invoice(selected)
+                st.json(result)
+
+    elif page == "Matching Check":
+        st.subheader("PO / Receipt / Invoice matching inspection")
+        with get_engine().connect() as conn:
+            invoice_ids = conn.execute(text("SELECT invoice_id FROM invoices WHERE po_id IS NOT NULL ORDER BY received_at DESC")).scalars().all()
+        if not invoice_ids:
+            st.info("No PO-backed invoices are available.")
+        else:
+            selected = st.selectbox("PO-backed invoice", invoice_ids)
+            match_col, inspect_col = st.columns(2)
+            with match_col:
+                run_match = st.button("Run automatic three-way matching", type="primary", use_container_width=True)
+            with inspect_col:
+                inspect_saved = st.button("Inspect saved matching records", use_container_width=True)
+            if run_match:
+                try:
+                    result = run_three_way_match(selected)
+                    if result["match_status"] == "MATCHED":
+                        st.success("Three-way matching completed without detected variances.")
+                    elif result["match_status"] == "NOT_APPLICABLE":
+                        st.info(result.get("message", "Matching is not applicable."))
+                    else:
+                        st.warning("Matching completed with variances. Blocking exceptions were recorded for review.")
+                    st.json(result)
+                except Exception as exc:
+                    st.error(f"Automatic matching failed: {exc}")
+                    st.exception(exc)
+            if inspect_saved:
+                try:
+                    st.json(inspect_invoice_matches(selected))
+                except Exception as exc:
+                    st.error(f"Could not inspect matching records: {exc}")
+except Exception as exc:
+    st.error("The dashboard could not load data from MySQL.")
+    st.exception(exc)
+    st.info("Check that your .env file contains the correct MySQL username, password, host and database name, and that MySQL Server is running.")
